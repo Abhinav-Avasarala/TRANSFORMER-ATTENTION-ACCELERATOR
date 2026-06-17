@@ -39,9 +39,12 @@ module qk_systolic #(
 );
 
     // -------------------------------------------------------------------------
-    // Latency: last PE [N-1][N-1] gets its final input at cycle 2(N-1)+(D-1),
-    // and mac_pe adds 2 cycles of pipeline. So results settle at cycle:
-    localparam int LAT       = 2*N + D - 1;
+    // Latency: PE[i][j] folds its last input (k=D-1) into sum_out at cycle
+    // i + j + D + 2. The slowest PE is [N-1][N-1], so all results are valid at:
+    //   cnt = 2(N-1) + D + 2 = 2*N + D
+    // We capture at exactly that cycle (sum_out is valid DURING the cnt==LAT
+    // cycle; the s_out register then latches it on the following edge).
+    localparam int LAT       = 2*N + D;
     localparam int CNT_WIDTH = $clog2(LAT + 1);
 
     // -------------------------------------------------------------------------
