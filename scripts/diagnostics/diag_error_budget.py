@@ -11,7 +11,7 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 import numpy as np
 
 N = D = 64
-GOLD = os.path.join(os.path.dirname(__file__), "..", "golden")
+GOLD = os.path.join(os.path.dirname(__file__), "..", "..", "golden")
 
 
 def load_hex(name):
