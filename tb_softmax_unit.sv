@@ -1,6 +1,8 @@
 // tb_softmax_unit.sv
 //
-// Testbench for softmax_unit (A = row-wise softmax(S) in Q8.8).
+// Testbench for softmax_unit (A = row-wise softmax(S / sqrt(D))).
+// s_in is Q8.8; a_out is now Q1.15 (higher-precision attention weights),
+// so the comparison below is real-valued, not raw-Q8.8-LSB.
 //
 // Unlike tb_qk_systolic.sv/tb_av_multiply.sv, this does NOT mirror the
 // RTL's internal arithmetic bit-for-bit as its golden model. softmax_unit
@@ -32,10 +34,16 @@
 module tb_softmax_unit;
 
     localparam int N          = 64;
+    localparam int D          = 64;   // must match softmax_unit's D -- see file header
     localparam int DATA_WIDTH = 16;
     localparam int FRAC_BITS  = 8;
-    localparam int CLK_PERIOD = 10;
-    localparam int TOLERANCE  = 6;   // max acceptable |raw error| per element, Q8.8 LSBs
+    localparam int  CLK_PERIOD = 10;
+    localparam real TOLERANCE  = 0.0035; // max acceptable |error| per weight, real terms.
+                                          // Measured worst case after the SCALE_CONST fix:
+                                          // 0.002867 (peaked/low-entropy case) -- this leaves
+                                          // ~20% margin above that, not the original rough
+                                          // 0.000745 estimate, which undercounted the peaked
+                                          // case specifically.
 
     // ---- DUT signals ----
     logic                  clk, rst_n, start, done;
@@ -76,21 +84,27 @@ module tb_softmax_unit;
                 S[i][j] = '0;
     endtask
 
-    // Column 0 strongly dominant (score 6.0 vs. 0.0 elsewhere) -- softmax
-    // should concentrate most of the weight there but not saturate fully.
+    // Column 0 strongly dominant. Raw score is 48.0, not 6.0: softmax_unit
+    // now divides by sqrt(D)=8 before exponentiating, so a raw gap of 48.0
+    // produces the same effective (post-scale) gap of 6.0 this layer was
+    // originally calibrated for -- softmax should concentrate most of the
+    // weight there but not saturate fully.
     task automatic fill_peaked();
         fill_zero();
         for (int i = 0; i < N; i++)
-            S[i][0] = 16'sd1536;   // 6.0 in Q8.8
+            S[i][0] = 16'sd12288;   // 48.0 in Q8.8 (-> effective 6.0 after /sqrt(D))
     endtask
 
-    // Signed random, raw range [-2048, 2047] (~[-8.0, +8.0) real) -- matches
-    // the exp_lut's clamp domain so both the "in range" and "clamped" LUT
-    // paths get exercised.
+    // Signed random, raw range [-16384, 16383] (~[-64.0, +64.0) real).
+    // 8x wider than the exp_lut's clamp domain on purpose: scores now get
+    // divided by sqrt(D)=8 before hitting the LUT, so a raw spread of only
+    // +-8.0 would collapse to +-1.0 post-scale and never reach the LUT's
+    // delta=8.0 clamp point. This wider range keeps both the "in range"
+    // and "clamped" LUT paths exercised, matching the pre-scaling intent.
     task automatic fill_random();
         for (int i = 0; i < N; i++)
             for (int j = 0; j < N; j++)
-                S[i][j] = 16'($urandom_range(0, 4095) - 2048);
+                S[i][j] = 16'($urandom_range(0, 32767) - 16384);
     endtask
 
     // =========================================================================
@@ -117,19 +131,20 @@ module tb_softmax_unit;
     endtask
 
     // =========================================================================
-    // check: compare DUT a_out against a true floating-point softmax,
-    // row by row, with a per-element tolerance. Reports max and mean
-    // absolute error (in Q8.8 raw units) alongside pass/fail.
+    // check: compare DUT a_out against a true floating-point softmax, row by
+    // row, in REAL terms. a_out is now Q1.15 (unsigned, /32768), NOT Q8.8 --
+    // softmax_unit emits attention weights at higher precision. Tolerance is
+    // real-valued (0.002), set ~2.7x above the measured worst-case weight
+    // error of 0.000745 (scripts/diag_rtl_model.py).
     // =========================================================================
     task automatic check(input string name);
         real max_r, sum_r, exp_r [0:N-1], softmax_r;
-        int  expected_raw, actual_raw, err, errors;
-        real total_abs_err, mean_abs_err;
-        int  max_err_overall;
+        real actual_r, err_r, max_err_overall, total_abs_err, mean_abs_err;
+        int  errors;
 
         errors = 0;
         total_abs_err = 0.0;
-        max_err_overall = 0;
+        max_err_overall = 0.0;
 
         for (int i = 0; i < N; i++) begin
             max_r = q8_8_to_real(S[i][0]);
@@ -138,25 +153,26 @@ module tb_softmax_unit;
 
             sum_r = 0.0;
             for (int j = 0; j < N; j++) begin
-                exp_r[j] = $exp(q8_8_to_real(S[i][j]) - max_r);
+                // (S[i][j] - max_r) / sqrt(D) -- matches softmax_unit's
+                // scaled-delta step (see softmax_unit.sv's file header)
+                exp_r[j] = $exp((q8_8_to_real(S[i][j]) - max_r) / $sqrt(real'(D)));
                 sum_r += exp_r[j];
             end
 
             for (int j = 0; j < N; j++) begin
-                softmax_r    = exp_r[j] / sum_r;
-                expected_raw = $rtoi(softmax_r * 256.0 + 0.5);
-                actual_raw   = int'(a_out[i][j]);
-                err          = actual_raw - expected_raw;
-                if (err < 0) err = -err;
+                softmax_r = exp_r[j] / sum_r;
+                actual_r  = real'(a_out[i][j]) / 32768.0;   // Q1.15 unsigned
+                err_r     = actual_r - softmax_r;
+                if (err_r < 0.0) err_r = -err_r;
 
-                total_abs_err += real'(err);
-                if (err > max_err_overall) max_err_overall = err;
+                total_abs_err += err_r;
+                if (err_r > max_err_overall) max_err_overall = err_r;
 
-                if (err > TOLERANCE) begin
+                if (err_r > TOLERANCE) begin
                     errors++;
                     if (errors <= 10)
-                        $display("    A[%0d][%0d]: got %0d, expected %0d (err=%0d)",
-                                 i, j, actual_raw, expected_raw, err);
+                        $display("    A[%0d][%0d]: got %.6f, expected %.6f (err=%.6f)",
+                                 i, j, actual_r, softmax_r, err_r);
                 end
             end
         end
@@ -165,11 +181,11 @@ module tb_softmax_unit;
         tests_run++;
         if (errors == 0) begin
             tests_passed++;
-            $display("  [PASS] %s  (max_err=%0d raw, mean_err=%.4f raw)",
+            $display("  [PASS] %s  (max_err=%.6f, mean_err=%.6f)",
                       name, max_err_overall, mean_abs_err);
         end else begin
             tests_failed++;
-            $display("  [FAIL] %s  (%0d/%0d mismatches, max_err=%0d raw, mean_err=%.4f raw)",
+            $display("  [FAIL] %s  (%0d/%0d mismatches, max_err=%.6f, mean_err=%.6f)",
                       name, errors, N*N, max_err_overall, mean_abs_err);
         end
     endtask

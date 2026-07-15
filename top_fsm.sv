@@ -44,7 +44,11 @@ module top_fsm #(
     parameter int D          = 64,   // head dimension
     parameter int DATA_WIDTH = 16,   // Q8.8 element width
     parameter int ACC_WIDTH  = 32,   // systolic accumulator width
-    parameter int FRAC_BITS  = 8     // Q8.8 fractional bits
+    parameter int FRAC_BITS  = 8,    // Q8.8 fractional bits
+    // Plumbed through to softmax_unit's inner instance so a testbench can
+    // point at exp_lut.hex via absolute path (Vivado's xsim runs from its
+    // own sim folder -- a relative default silently loads an all-zero LUT).
+    parameter string EXP_LUT_FILE = "exp_lut.hex"
 )(
     input  logic                  clk,
     input  logic                  rst_n,         // active-low, synchronous
@@ -85,7 +89,8 @@ module top_fsm #(
     logic [DATA_WIDTH-1:0] a_out [0:N-1][0:N-1];
 
     softmax_unit #(
-        .N(N), .DATA_WIDTH(DATA_WIDTH), .FRAC_BITS(FRAC_BITS)
+        .N(N), .D(D), .DATA_WIDTH(DATA_WIDTH), .FRAC_BITS(FRAC_BITS),
+        .EXP_LUT_FILE(EXP_LUT_FILE)
     ) sm_inst (
         .clk(clk), .rst_n(rst_n), .start(sm_start),
         .s_in(s_out), .a_out(a_out), .done(sm_done)
@@ -96,9 +101,11 @@ module top_fsm #(
     logic [DATA_WIDTH-1:0] v_in [0:D-1];
     logic [DATA_WIDTH-1:0] o_out [0:N-1][0:D-1];
 
+    // A_FRAC_BITS=15: softmax_unit emits attention weights as Q1.15, so
+    // av_multiply must interpret its a_in feed at 15 fractional bits.
     av_multiply #(
         .N(N), .D(D), .DATA_WIDTH(DATA_WIDTH),
-        .ACC_WIDTH(ACC_WIDTH), .FRAC_BITS(FRAC_BITS)
+        .ACC_WIDTH(ACC_WIDTH), .FRAC_BITS(FRAC_BITS), .A_FRAC_BITS(15)
     ) av_inst (
         .clk(clk), .rst_n(rst_n), .start(av_start),
         .a_in(a_in), .v_in(v_in), .o_out(o_out), .done(av_done)

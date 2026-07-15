@@ -1,111 +1,114 @@
 // reciprocal_nr.sv
 //
-// Computes R ~= 1/D in Q8.8, using a bit-shift seed + Newton-Raphson.
+// Computes R ~= 1/D using a bit-shift seed + Newton-Raphson, with the
+// OUTPUT format independent of the INPUT format. softmax_unit needs the
+// reciprocal at higher fractional precision than Q8.8: 1/row_sum is a
+// small number (~0.0156 .. 1.0), and storing it at Q8.8's 1/256 step
+// gives up to ~25% relative error on the small end, which dominates the
+// final attention error (measured: A=Q8.8+recip=Q8.8 -> max O error
+// 0.07; widening BOTH the weights and this reciprocal -> 0.006). So this
+// module now takes:
+//   input  d_in : Q(DATA_WIDTH-FRAC_BITS).FRAC_BITS   (unchanged, Q8.8)
+//   output r_out: Q(OUT_WIDTH-OUT_FRAC).OUT_FRAC      (softmax uses 16 frac)
 //
-// PRECONDITION (caller's responsibility): D >= 256 (i.e. D represents a
-// real value >= 1.0). softmax_unit only ever calls this with D = a row's
-// sum of exp() values, which is guaranteed >= 1.0 because the row's own
-// max-scoring element always contributes exp(0) = 1.0 to the sum. This
-// keeps msb_pos >= FRAC_BITS, so the seed's right-shift amount
-// (msb_pos - FRAC_BITS) stays non-negative, without needing an explicit
-// divide-by-zero guard.
+// PRECONDITION (caller's responsibility): D >= 2^FRAC_BITS (i.e. D >= 1.0).
+// softmax_unit only ever calls this with D = a row's sum of exp() values,
+// guaranteed >= 1.0 (the row's max-scoring element contributes exp(0)=1.0).
+// This keeps msb_pos >= FRAC_BITS, so the seed's right-shift amount stays
+// non-negative, without needing a divide-by-zero guard.
 //
 // Algorithm:
-//   1. Seed: find m = position of D's MSB (priority encoder), plus the
-//      3 mantissa bits just below it, to pick a seed from an 8-entry
-//      table -- within ~6% of the true reciprocal (Q8.8 integers), vs.
-//      ~2x error if only m is used. No multiplier needed either way.
-//   2. Newton-Raphson iterations: r_{n+1} = r_n * (2 - D*r_n)
-//      Each iteration roughly doubles the number of correct bits, so 3
-//      iterations starting from a within-6% seed comfortably covers
-//      Q8.8's 8 fractional bits.
-//
-// WHY THE MANTISSA BITS MATTER (not just an accuracy nicety): a coarse
-// seed using only m has up to 2x error, and Newton-Raphson division only
-// self-corrects while D*r stays reasonably close to 1.0. If the seed is
-// ~2x too big, D*r0 ~= 2.0, so the first correction factor (2 - D*r0)
-// collapses to ~0 -- multiplying r by that destroys the estimate instead
-// of refining it, and Q8.8's coarse resolution (nothing below 1/256)
-// means it never recovers in the remaining iterations. Verified by hand:
-// with the coarse (m-only) seed, D=511 (row_sum ~= 2.0) collapses to
-// r=1 (decoded ~0.004) instead of converging to the correct r=128
-// (~0.5) -- a ~50% error, not rounding noise. The 3-mantissa-bit seed
-// below fixes this (D=511 now converges to exactly 128 in 1 iteration).
+//   1. Seed: MSB position (priority encoder) picks the power-of-two
+//      bucket; 3 mantissa bits below it pick 1 of 8 sub-buckets from
+//      SEED_LUT. SEED_LUT is COMPUTED at elaboration from OUT_FRAC (not
+//      hardcoded), so it is correct at any output precision -- the old
+//      hardcoded-for-Q8.8 table was the source of an earlier convergence
+//      bug and would have been silently wrong at 16 frac bits.
+//      Seed is within ~6% of 1/D (well clear of the ~2x point where the
+//      NR correction term collapses to zero and the estimate dies).
+//   2. Newton-Raphson: r <- r * (2 - D*r). Quadratic convergence (~doubles
+//      correct bits each step). ITERATIONS default 3 covers Q8.8; use 4
+//      for 16-bit output precision (see softmax_unit's instantiation).
 
 `timescale 1ns/1ps
 
 module reciprocal_nr #(
-    parameter int DATA_WIDTH = 16,
-    parameter int FRAC_BITS  = 8,
+    parameter int DATA_WIDTH = 16,   // input d width
+    parameter int FRAC_BITS  = 8,    // input d fractional bits
+    parameter int OUT_WIDTH  = 16,   // output r width  (default: same as input)
+    parameter int OUT_FRAC   = 8,    // output r fractional bits (default: Q8.8)
     parameter int ITERATIONS = 3
 )(
     input  logic                  clk,
     input  logic                  rst_n,
     input  logic                  start,
-    input  logic [DATA_WIDTH-1:0] d_in,    // Q8.8, unsigned, >= 256 (see precondition above)
-    output logic [DATA_WIDTH-1:0] r_out,   // Q8.8, unsigned, ~= 1/d_in
+    input  logic [DATA_WIDTH-1:0] d_in,    // Q(.FRAC_BITS), unsigned, >= 1.0
+    output logic [OUT_WIDTH-1:0]  r_out,   // Q(.OUT_FRAC),  unsigned, ~= 1/d_in
     output logic                  done
 );
 
     localparam int ITER_WIDTH = $clog2(ITERATIONS + 1);
-    localparam logic [DATA_WIDTH-1:0] TWO_Q8_8 = (2 << FRAC_BITS); // 2.0 in Q8.8
+    localparam int MSB_WIDTH   = $clog2(DATA_WIDTH);
+
+    // ---- Seed table, computed at elaboration for this OUT_FRAC ----
+    // SEED_LUT[frac] = round(2^OUT_FRAC / mantissa_center(frac)), where
+    // mantissa_center(frac) = 1 + (2*frac+1)/16 is the midpoint of the
+    // frac-th sub-bucket of the normalized mantissa range [1, 2).
+    // NOTE: int'() rounds to nearest on its own (unlike $rtoi(), which
+    // truncates) -- no "+ 0.5" needed. See softmax_unit.sv's SCALE_CONST
+    // comment for how the same mistake there caused a real, measured bug.
+    // Harmless here in practice (Newton-Raphson's self-correction absorbs
+    // a 1-off seed), but fixed for correctness and consistency.
+    function automatic int unsigned seed_val(input int frac);
+        real center;
+        center = 1.0 + (2.0 * real'(frac) + 1.0) / 16.0;
+        return int'(real'(64'd1 << OUT_FRAC) / center);
+    endfunction
+
+    localparam int unsigned SEED_LUT [0:7] = '{
+        seed_val(0), seed_val(1), seed_val(2), seed_val(3),
+        seed_val(4), seed_val(5), seed_val(6), seed_val(7)
+    };
 
     typedef enum logic [1:0] {IDLE, SEED, ITER, DONE_ST} state_t;
     state_t state;
 
-    logic [DATA_WIDTH-1:0] d_reg, r_reg;
+    logic [DATA_WIDTH-1:0] d_reg;
+    logic [OUT_WIDTH-1:0]  r_reg;
     logic [ITER_WIDTH-1:0] iter_cnt;
 
-    // ---- Priority encoder: m = index of D's most-significant set bit ----
-    logic [$clog2(DATA_WIDTH)-1:0] msb_pos;
+    // ---- Priority encoder: msb_pos = index of D's most-significant set bit ----
+    logic [MSB_WIDTH-1:0] msb_pos;
     always_comb begin
         msb_pos = '0;
         for (int b = DATA_WIDTH-1; b >= 0; b--)
             if (d_reg[b]) begin
-                msb_pos = b[$clog2(DATA_WIDTH)-1:0];
+                msb_pos = b[MSB_WIDTH-1:0];
                 break;
             end
     end
 
-    // ---- Fine seed: 3 mantissa bits just below the MSB, i.e. which of
-    // 8 sub-buckets D falls into within [2^m, 2^(m+1)). base_seed[frac]
-    // is precomputed for the canonical bucket m=FRAC_BITS (D in
-    // [2^FRAC_BITS, 2^(FRAC_BITS+1))); every other bucket is the same
-    // shape just scaled by a power of two, handled by the right-shift in
-    // SEED below. Table values: round(2^(FRAC_BITS+4) / (17 + 2*frac)),
-    // i.e. round(256/x_center) for x_center = 1 + (2*frac+1)/16 -- the
-    // midpoint of sub-bucket `frac` in normalized [1,2) space. Assumes
-    // FRAC_BITS=8 (this project's only Q8.8 configuration); a different
-    // FRAC_BITS would need a regenerated table.
+    // 3 mantissa bits just below the MSB -> which of 8 sub-buckets.
     logic [2:0] frac_bits;
     assign frac_bits = d_reg[msb_pos-1 -: 3];
 
-    logic [DATA_WIDTH-1:0] base_seed;
-    always_comb begin
-        case (frac_bits)
-            3'd0: base_seed = 16'd241;
-            3'd1: base_seed = 16'd216;
-            3'd2: base_seed = 16'd195;
-            3'd3: base_seed = 16'd178;
-            3'd4: base_seed = 16'd164;
-            3'd5: base_seed = 16'd152;
-            3'd6: base_seed = 16'd141;
-            3'd7: base_seed = 16'd132;
-        endcase
-    end
+    // ---- One Newton-Raphson step, combinational, with mixed input/output
+    // fractional bits tracked explicitly:
+    //   t1 = (D * r) >> FRAC_BITS   -> product's OUT_FRAC frac bits, ~= 1.0
+    //   t2 = 2.0 - t1               (at OUT_FRAC frac)
+    //   r_next = (r * t2) >> OUT_FRAC
+    logic [DATA_WIDTH+OUT_WIDTH-1:0] prod_d_r;
+    logic [OUT_WIDTH+1:0]            t1, t2;
+    logic [2*OUT_WIDTH+1:0]          prod_r_t2;
+    logic [OUT_WIDTH-1:0]            r_next;
 
-    // ---- One Newton-Raphson step, combinational ----
-    //   t1 = (D * r) >> FRAC_BITS         (Q8.8 * Q8.8 -> Q8.8)
-    //   t2 = 2.0 - t1                     (Q8.8)
-    //   r_next = (r * t2) >> FRAC_BITS    (Q8.8)
-    logic [2*DATA_WIDTH-1:0] prod_d_r, prod_r_t2;
-    logic [DATA_WIDTH-1:0]   t1, t2, r_next;
+    localparam logic [OUT_WIDTH+1:0] TWO_OUT = (OUT_WIDTH+2)'(2) << OUT_FRAC;
 
     assign prod_d_r  = d_reg * r_reg;
-    assign t1         = prod_d_r[FRAC_BITS +: DATA_WIDTH];
-    assign t2         = TWO_Q8_8 - t1;
+    assign t1         = prod_d_r[FRAC_BITS +: (OUT_WIDTH+2)];
+    assign t2         = TWO_OUT - t1;
     assign prod_r_t2  = r_reg * t2;
-    assign r_next      = prod_r_t2[FRAC_BITS +: DATA_WIDTH];
+    assign r_next      = prod_r_t2[OUT_FRAC +: OUT_WIDTH];
 
     always_ff @(posedge clk) begin
         if (!rst_n) begin
@@ -125,21 +128,19 @@ module reciprocal_nr #(
                     end
                 end
 
-                // r0 = base_seed[frac_bits] >> (msb_pos - FRAC_BITS)
-                // (see header + table comments above for derivation)
+                // r0 = SEED_LUT[frac_bits] >> (msb_pos - FRAC_BITS)
                 SEED: begin
-                    r_reg    <= base_seed >> (msb_pos - FRAC_BITS);
+                    r_reg    <= OUT_WIDTH'(SEED_LUT[frac_bits]) >> (msb_pos - MSB_WIDTH'(FRAC_BITS));
                     iter_cnt <= '0;
                     state    <= ITER;
                 end
 
                 ITER: begin
                     r_reg <= r_next;
-                    if (iter_cnt == ITER_WIDTH'(ITERATIONS - 1)) begin
+                    if (iter_cnt == ITER_WIDTH'(ITERATIONS - 1))
                         state <= DONE_ST;
-                    end else begin
+                    else
                         iter_cnt <= iter_cnt + 1'b1;
-                    end
                 end
 
                 DONE_ST: begin

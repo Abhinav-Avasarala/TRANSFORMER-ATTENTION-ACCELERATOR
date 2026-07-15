@@ -3,12 +3,17 @@
 // Computes O = A * V  (the "blend" stage of attention).
 //   A : [N x N]  Attention weights (softmax output). Each row sums to ~1.0.
 //                Fed ROW-wise, exactly like Q in qk_systolic -- no transpose
-//                involved, A is used as-is.
-//   V : [N x D]  Value matrix, one row per token.
+//                involved, A is used as-is. Format is Q1.A_FRAC_BITS
+//                (softmax_unit emits Q1.15), NOT the Q8.8 used elsewhere:
+//                weights are non-negative and < 1, clamped to 0x7FFF so
+//                mac_pe's signed multiply reads them correctly as positive.
+//   V : [N x D]  Value matrix, one row per token, signed Q8.8.
 //                Fed COLUMN-wise (NOT row-wise like K was). O = A*V is a
 //                plain matmul, so there's no transpose trick available here
 //                -- column c of V is streamed into PE-column c over time.
-//   O : [N x D]  O[i][c] = sum_j A[i][j] * V[j][c], in Q8.8.
+//   O : [N x D]  O[i][c] = sum_j A[i][j] * V[j][c], in Q8.8. Since A and V
+//                have different fractional-bit counts, the output truncation
+//                drops A_FRAC_BITS bits (not FRAC_BITS) -- see below.
 //
 // Same output-stationary systolic architecture as qk_systolic.sv, but the
 // CONTRACTION (summed) dimension here is N (sequence length), not D (head
@@ -31,14 +36,19 @@ module av_multiply #(
     parameter int D          = 64,   // head dimension: columns of V/O, PE columns
     parameter int DATA_WIDTH = 16,   // Q8.8 element width
     parameter int ACC_WIDTH  = 32,   // 16x16 product + accumulation headroom
-    parameter int FRAC_BITS  = 8     // Q8.8 fractional bits
+    parameter int FRAC_BITS  = 8,    // V and O fractional bits (Q8.8)
+    parameter int A_FRAC_BITS = 8    // A (attention-weight) fractional bits.
+                                      // Defaults to FRAC_BITS (symmetric Q8.8);
+                                      // softmax_unit now emits A as Q1.15, so
+                                      // top_fsm instantiates this with A_FRAC_BITS=15.
 )(
     input  logic                  clk,
     input  logic                  rst_n,         // active-low, synchronous
     input  logic                  start,         // 1-cycle pulse to begin
 
-    input  logic [DATA_WIDTH-1:0] a_in [0:N-1],  // skewed A feed (per row)
-    input  logic [DATA_WIDTH-1:0] v_in [0:D-1],  // skewed V feed (per column)
+    input  logic [DATA_WIDTH-1:0] a_in [0:N-1],  // skewed A feed (per row), Q1.A_FRAC_BITS,
+                                                  // non-negative (mac_pe reads it signed)
+    input  logic [DATA_WIDTH-1:0] v_in [0:D-1],  // skewed V feed (per column), signed Q8.8
 
     output logic [DATA_WIDTH-1:0] o_out [0:N-1][0:D-1],  // context output, Q8.8
     output logic                  done
@@ -151,15 +161,18 @@ module av_multiply #(
     endgenerate
 
     // -------------------------------------------------------------------------
-    // Capture + truncate to Q8.8 when results are valid. Same raw bit-select
-    // truncation as qk_systolic (no rounding, no saturation -- see that
-    // file's header for the overflow caveat, which applies here too).
+    // Capture + truncate to Q8.8 when results are valid. Each PE accumulates
+    // A(Q1.A_FRAC_BITS) * V(Q8.FRAC_BITS), so pe_out has (A_FRAC_BITS +
+    // FRAC_BITS) fractional bits. To emit O as Q8.FRAC_BITS, drop A_FRAC_BITS
+    // frac bits -> bit-select starts at A_FRAC_BITS (= FRAC_BITS in the
+    // symmetric Q8.8 default; = 15 when A is Q1.15). No rounding/saturation,
+    // same caveat as qk_systolic's header.
     // -------------------------------------------------------------------------
     always_ff @(posedge clk) begin
         if (capture) begin
             for (int r = 0; r < N; r++)
                 for (int col = 0; col < D; col++)
-                    o_out[r][col] <= pe_out[r][col][FRAC_BITS +: DATA_WIDTH];
+                    o_out[r][col] <= pe_out[r][col][A_FRAC_BITS +: DATA_WIDTH];
         end
     end
 
